@@ -1,0 +1,41 @@
+version: '3.8'
+
+services:
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "8081:80"
+    depends_on:
+      - backend
+    networks:
+      - app-network
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    ports:
+      - "8636:8636"
+    environment:
+      - PORT=8636
+      - UPLOAD_FOLDER=/app/uploads
+      - DB_FILE=/app/data/app.db
+      - TOKEN_EXPIRE_SECONDS=300
+      - RATE_LIMIT_REQUESTS=5
+      - RATE_LIMIT_WINDOW=60
+      - MAX_FILE_SIZE=52428800
+    volumes:
+      - uploads:/app/uploads
+      - data:/app/data
+    networks:
+      - app-network
+
+networks:
+  app-network:
+    driver: bridge
+
+volumes:
+  uploads:
+  data:
