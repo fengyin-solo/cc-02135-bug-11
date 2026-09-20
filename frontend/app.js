@@ -79,52 +79,115 @@ document.addEventListener('DOMContentLoaded', async () => {
     loadFileList();
 });
 
-// 验证文件
+// 从浏览器历史/bfcache 切回本页时重新拉取目录，避免看到切换前的旧大小/旧条目
+window.addEventListener('pageshow', (event) => {
+    if (event.persisted) {
+        loadFileList();
+    }
+});
+
+// ===== 文件校验：浏览器端与服务端共用同一份判定规则 =====
+// 规则与后端 validation.py 一一对应：
+// - 命中黑名单任意一个扩展名段即拒绝；
+// - 无扩展名文件合法（黑名单模式不拦截）；
+// - 归一化大小写、末尾点/空格，防止 evil.PHP、evil.php. 绕过；
+// - 检查所有扩展名段，防止 evil.php.jpg 这类多重扩展绕过。
+function normalizeFilename(filename) {
+    if (!filename) return '';
+    let name = String(filename).replace(/\0/g, '').replace(/[/\\]/g, '_');
+    name = name.trim().replace(/[.\s]+$/, '');
+    return name;
+}
+
+function getExtensionSegments(filename) {
+    const name = normalizeFilename(filename);
+    const dotIndex = name.indexOf('.');
+    if (dotIndex < 0) return [];
+    return name.slice(dotIndex + 1).split('.').map(seg => seg.toLowerCase());
+}
+
 function validateFile(file) {
+    const name = normalizeFilename(file.name);
+    if (!name) return '文件名不合法';
+
+    const segments = getExtensionSegments(file.name);
+    const blocked = segments.find(ext => CONFIG.BLOCKED_EXTENSIONS.includes(ext));
+    if (blocked) return `不支持的文件类型（.${blocked} 文件被禁止上传）`;
+
     if (file.size > CONFIG.MAX_FILE_SIZE) {
         return `文件大小超过限制（最大${CONFIG.MAX_FILE_SIZE / 1024 / 1024}MB）`;
     }
     return null;
 }
 
-// 上传文件处理函数
+// 串行上传队列：连续拖放多个文件时排队处理，避免并发请求互相踩状态、
+// 避免同一份内容在服务端去重生效前被写入两条目录记录。
+const uploadQueue = {
+    items: [],
+    running: false,
+
+    add(files) {
+        Array.from(files).forEach(file => this.items.push(file));
+        if (!this.running) this.runNext();
+    },
+
+    async runNext() {
+        this.running = true;
+        while (this.items.length > 0) {
+            const file = this.items.shift();
+            await uploadFile(file);
+        }
+        this.running = false;
+        // 全部上传结束后以服务端目录为准刷新一次，确保列表/大小与服务端一致
+        await loadFileList();
+    }
+};
+
+// 上传单个文件（校验失败只提示，绝不发请求；服务端的拒绝结果以错误提示收口）
 async function uploadFile(file) {
     const validationError = validateFile(file);
+    const statusEl = document.getElementById('uploadStatus');
     if (validationError) {
-        document.getElementById('uploadStatus').textContent = `❌ ${validationError}`;
+        statusEl.textContent = `❌ ${file.name}：${validationError}`;
         return;
     }
 
-    showLoading('上传中...');
-    
+    showLoading(`上传中：${file.name}`);
+
     const formData = new FormData();
     formData.append('file', file);
 
     try {
-        const response = await fetch(`${API_BASE}/upload`, {
-            method: 'POST',
-            body: formData
-        });
-        const result = await response.json();
-        
-        if (response.ok) {
-            document.getElementById('uploadStatus').textContent = `✅ ${file.name} 上传成功！`;
-            loadFileList();
+        const response = await fetch(`${API_BASE}/upload`, { method: 'POST', body: formData });
+        let result = null;
+        try {
+            result = await response.json();
+        } catch {
+            result = {};
+        }
+
+        if (response.ok && result.success) {
+            statusEl.textContent = result.duplicate
+                ? `ℹ️ ${file.name}：${result.message || '相同内容的文件已存在'}`
+                : `✅ ${file.name} 上传成功！`;
+            // 每个文件上传后即刷新目录，但最终由队列再统一收口刷新一次
+            await loadFileList();
         } else {
-            document.getElementById('uploadStatus').textContent = `❌ 上传失败: ${result.error}`;
+            // 服务端校验拒绝必须实际生效：提示与目录回显以服务端判定为准
+            statusEl.textContent = `❌ ${file.name} 上传失败: ${result.error || '未知错误'}`;
         }
     } catch (error) {
-        document.getElementById('uploadStatus').textContent = `❌ 上传失败: ${error.message}`;
+        statusEl.textContent = `❌ ${file.name} 上传失败: ${error.message}`;
     } finally {
         hideLoading();
     }
 }
 
-// 文件选择上传
+// 文件选择上传（支持多选）
 document.getElementById('fileInput').addEventListener('change', async (e) => {
-    const file = e.target.files[0];
-    if (!file) return;
-    await uploadFile(file);
+    if (e.target.files && e.target.files.length > 0) {
+        uploadQueue.add(e.target.files);
+    }
     e.target.value = '';
 });
 
@@ -141,27 +204,36 @@ uploadZone.addEventListener('dragleave', (e) => {
     uploadZone.classList.remove('drag-over');
 });
 
-uploadZone.addEventListener('drop', async (e) => {
+uploadZone.addEventListener('drop', (e) => {
     e.preventDefault();
     uploadZone.classList.remove('drag-over');
-    
-    const file = e.dataTransfer.files[0];
-    if (file) {
-        await uploadFile(file);
+
+    if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+        uploadQueue.add(e.dataTransfer.files);
     }
 });
 
 // 加载文件列表
+// 请求序列号：连续拖放上传、切换页面、提交后立即查看会触发多次拉取，
+// 只有最后一次请求的响应允许渲染，旧响应直接丢弃，避免“旧大小/旧条目”覆盖新列表。
+let fileListRequestSeq = 0;
+
 async function loadFileList() {
+    const seq = ++fileListRequestSeq;
     showLoading('加载文件列表...');
-    
+
     try {
-        const response = await fetch(`${API_BASE}/files`);
+        // 时间戳绕过浏览器/中间层缓存；服务端同时下发 Cache-Control: no-store
+        const response = await fetch(`${API_BASE}/files?t=${Date.now()}`, { cache: 'no-store' });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
         const files = await response.json();
-        
+
+        // 过期响应不得渲染，保证目录回显始终是最新一次的判定结果
+        if (seq !== fileListRequestSeq) return files;
+
         const fileList = document.getElementById('fileList');
         const isLoggedIn = TokenManager.get() && (await TokenManager.isValid());
-        
+
         if (files.length === 0) {
             fileList.innerHTML = '<p class="empty-msg">暂无可下载文件</p>';
         } else {
@@ -183,11 +255,15 @@ async function loadFileList() {
                 </div>
             `).join('');
         }
+        return files;
     } catch (error) {
-        document.getElementById('fileList').innerHTML = 
+        if (seq !== fileListRequestSeq) return;
+        document.getElementById('fileList').innerHTML =
             `<p class="empty-msg">加载失败: ${escapeHtml(error.message)}</p>`;
     } finally {
-        hideLoading();
+        if (seq === fileListRequestSeq) {
+            hideLoading();
+        }
     }
 }
 
@@ -285,7 +361,8 @@ document.getElementById('authForm').addEventListener('submit', async (e) => {
             // 保存token和用户名到本地
             TokenManager.save(result.token, username);
             await updateUserBar();
-            loadFileList();
+            // 等待目录回显完成再继续，保证提交后立即看到的列表/大小是最新的
+            await loadFileList();
             
             closeAuthModal();
             document.getElementById('loadingText').textContent = '验证成功，正在下载...';
@@ -336,20 +413,27 @@ document.getElementById('authForm').addEventListener('submit', async (e) => {
     }
 });
 
-// 显示加载动画
+// 显示加载动画（引用计数：连续上传/刷新并发时，全部结束才隐藏遮罩）
+let loadingCount = 0;
 function showLoading(text = '加载中...') {
+    loadingCount++;
     document.getElementById('loadingText').textContent = text;
     document.getElementById('loadingOverlay').classList.add('active');
 }
 
 // 隐藏加载动画
 function hideLoading() {
-    document.getElementById('loadingOverlay').classList.remove('active');
+    loadingCount = Math.max(0, loadingCount - 1);
+    if (loadingCount === 0) {
+        document.getElementById('loadingOverlay').classList.remove('active');
+    }
 }
 
 // 获取文件图标
 function getFileIcon(filename) {
-    const ext = filename.split('.').pop().toLowerCase();
+    // 与校验逻辑一致：按归一化后的最后一个扩展名段取图标
+    const segments = getExtensionSegments(filename);
+    const ext = segments.length > 0 ? segments[segments.length - 1] : '';
     const icons = {
         pdf: '📄', doc: '📝', docx: '📝', txt: '📃',
         jpg: '🖼️', jpeg: '🖼️', png: '🖼️', gif: '🖼️',
@@ -520,7 +604,8 @@ async function loadMyShares() {
     section.style.display = 'block';
     
     try {
-        const response = await fetch(`${API_BASE}/shares`, {
+        const response = await fetch(`${API_BASE}/shares?t=${Date.now()}`, {
+            cache: 'no-store',
             headers: {
                 'Authorization': `Bearer ${TokenManager.get()}`
             }

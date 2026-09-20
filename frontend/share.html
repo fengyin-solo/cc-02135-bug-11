@@ -90,9 +90,13 @@
             return div.innerHTML;
         }
 
-        // 获取文件图标
+        // 获取文件图标（与首页/后端校验的扩展名归一规则保持一致）
         function getFileIcon(filename) {
-            const ext = filename.split('.').pop().toLowerCase();
+            let name = String(filename || '').replace(/\0/g, '').replace(/[/\\]/g, '_');
+            name = name.trim().replace(/[.\s]+$/, '');
+            const dotIndex = name.indexOf('.');
+            const segments = dotIndex < 0 ? [] : name.slice(dotIndex + 1).split('.').map(s => s.toLowerCase());
+            const ext = segments.length ? segments[segments.length - 1] : '';
             const icons = {
                 pdf: '📄', doc: '📝', docx: '📝', txt: '📃',
                 jpg: '🖼️', jpeg: '🖼️', png: '🖼️', gif: '🖼️',
@@ -136,7 +140,7 @@
             }
 
             try {
-                const response = await fetch(`${API_BASE}/share/${currentShareId}`);
+                const response = await fetch(`${API_BASE}/share/${currentShareId}?t=${Date.now()}`, { cache: 'no-store' });
                 shareInfo = await response.json();
 
                 if (!response.ok) {
@@ -228,6 +232,11 @@
 
         // 页面加载时获取分享信息
         document.addEventListener('DOMContentLoaded', loadShareInfo);
+
+        // 从 bfcache 切回本页（如浏览器后退）时重新拉取，避免显示旧的下载次数/文件信息
+        window.addEventListener('pageshow', (event) => {
+            if (event.persisted) loadShareInfo();
+        });
     </script>
 </body>
 </html>
