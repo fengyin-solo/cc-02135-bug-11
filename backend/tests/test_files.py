@@ -30,6 +30,58 @@ def test_upload_invalid_extension(client):
     assert response.status_code == 400
 
 
+def test_upload_blocked_extensions_case_and_suffix(client):
+    """扩展名黑名单应拦截大小写变体及结尾点/空格伪装"""
+    from routes.file_routes import validate_filename
+    for name in ['a.EXE', 'b.Sh', 'c.bat.', 'd.cmd ', 'e.PS1']:
+        valid, _ext, error = validate_filename(name)
+        assert valid is False
+        assert error == '不支持的文件类型'
+
+
+def test_upload_without_extension_allowed(client):
+    """没有扩展名的合法文件（含点号开头的隐藏文件）不应被误拦"""
+    from routes.file_routes import allowed_file
+    assert allowed_file('Makefile') is True
+    assert allowed_file('.bashrc') is True
+
+    data = {'file': (io.BytesIO(b'makefile content'), 'Makefile')}
+    response = client.post('/api/upload', data=data, content_type='multipart/form-data')
+    assert response.status_code == 200
+
+
+def test_upload_duplicate_returns_same_file(client):
+    """连续重复上传同一文件应去重，目录中只出现一次"""
+    payload = b'duplicate payload bytes'
+    for _ in range(2):
+        data = {'file': (io.BytesIO(payload), 'dup_unique_name.txt')}
+        resp = client.post('/api/upload', data=data, content_type='multipart/form-data')
+        assert resp.status_code == 200
+
+    files = client.get('/api/files').get_json()
+    matches = [f for f in files if f['name'] == 'dup_unique_name.txt']
+    assert len(matches) == 1
+
+
+def test_upload_response_includes_authoritative_size(client):
+    """上传响应应返回最终落盘大小，供提示/属性/列表共用"""
+    data = {'file': (io.BytesIO(b'12345'), 'size_check.txt')}
+    resp = client.post('/api/upload', data=data, content_type='multipart/form-data')
+    result = resp.get_json()
+    assert result['success'] is True
+    assert result['size'] == 5
+
+
+def test_upload_size_limit_still_enforced(client, monkeypatch):
+    """修复后既有大小限制必须保持"""
+    import routes.file_routes as fr
+    monkeypatch.setattr(fr, 'MAX_FILE_SIZE', 3)
+    data = {'file': (io.BytesIO(b'1234'), 'too_big.txt')}
+    resp = client.post('/api/upload', data=data, content_type='multipart/form-data')
+    assert resp.status_code == 400
+    assert '大小' in resp.get_json()['error']
+
+
 def test_list_files(client):
     """测试文件列表"""
     response = client.get('/api/files')

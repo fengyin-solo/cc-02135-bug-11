@@ -132,6 +132,20 @@ h2 {
     background: rgba(34, 197, 94, 0.1);
 }
 
+/* 上传队列进行中：明确提示并阻止重复选择/拖放 */
+.upload-zone.uploading {
+    opacity: 0.6;
+    pointer-events: none;
+    border-color: var(--accent);
+}
+
+.upload-btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+    transform: none;
+    box-shadow: none;
+}
+
 .upload-icon {
     width: 64px;
     height: 64px;

@@ -14,12 +14,37 @@ from config import UPLOAD_FOLDER, MAX_FILE_SIZE, BLOCKED_EXTENSIONS, SHARE_LINK_
 logger = logging.getLogger(__name__)
 
 
+def get_file_extension(filename):
+    """统一的扩展名解析入口（浏览器校验/服务端校验/落盘命名必须共用同一套规则）。
+
+    - 没有扩展名（包括 ".bashrc" 这类点号开头的隐藏文件）返回 ''
+    - 先去掉结尾的点和空格，避免 "a.exe." / "a.exe " 绕过黑名单
+    """
+    name = (filename or '').strip().rstrip('.').strip()
+    dot = name.rfind('.')
+    if dot <= 0:
+        return ''
+    return name[dot + 1:].strip().rstrip('.').strip().lower()
+
+
+def validate_filename(filename):
+    """校验文件名，返回 (是否通过, 扩展名, 错误信息)。
+
+    upload 入口和目录回显共用这一份判定结果，避免两边规则漂移。
+    """
+    if not filename or not filename.strip():
+        return False, '', '未选择文件'
+
+    ext = get_file_extension(filename)
+    if ext in BLOCKED_EXTENSIONS:
+        return False, ext, '不支持的文件类型'
+    return True, ext, None
+
+
 def allowed_file(filename):
-    """检查文件扩展名是否被禁止"""
-    if '.' not in filename:
-        return False
-    ext = filename.rsplit('.', 1)[1].lower()
-    return ext not in BLOCKED_EXTENSIONS
+    """检查文件扩展名是否被禁止（保留原函数名供调用方/测试使用）"""
+    valid, _ext, _error = validate_filename(filename)
+    return valid
 
 
 @files_bp.route('/api/upload', methods=['POST'])
@@ -31,8 +56,10 @@ def upload_file():
     if file.filename == '':
         return jsonify({'error': '未选择文件'}), 400
 
-    if not allowed_file(file.filename):
-        return jsonify({'error': '不支持的文件类型'}), 400
+    # 统一的文件校验入口：浏览器端规则与这里保持一致
+    valid, ext, validation_error = validate_filename(file.filename)
+    if not valid:
+        return jsonify({'error': validation_error}), 400
 
     file.seek(0, 2)
     file_size = file.tell()
@@ -42,39 +69,97 @@ def upload_file():
         return jsonify({'error': f'文件大小超过限制（最大{MAX_FILE_SIZE // 1024 // 1024}MB）'}), 400
 
     file_id = str(uuid.uuid4())
-    # 保留原始文件名用于显示（去掉路径分隔符防止注入）
-    original_name = re.sub(r'[/\\]', '_', file.filename).strip()
+    # 保留原始文件名用于显示（去掉路径分隔符、结尾的点和空格）
+    original_name = re.sub(r'[/\\]', '_', file.filename).strip().rstrip('.').strip()
     if not original_name:
         original_name = file_id
 
-    # 磁盘上用 UUID + 扩展名存储，避免文件名编码问题
-    ext = file.filename.rsplit('.', 1)[1].lower() if '.' in file.filename else ''
+    # 磁盘上用 UUID + 扩展名存储，避免文件名编码问题；扩展名取自统一解析函数
     safe_filename = f"{file_id}.{ext}" if ext else file_id
     filepath = os.path.join(UPLOAD_FOLDER, safe_filename)
-    file.save(filepath)
 
-    file_size = os.path.getsize(filepath)
+    # 失败收口：任何一步失败都不能留下半成品（孤儿文件/半截数据库记录）
+    try:
+        file.save(filepath)
+        file_size = os.path.getsize(filepath)
 
-    conn = get_db()
-    cursor = conn.cursor()
-    cursor.execute(
-        'INSERT INTO files (id, name, path, size) VALUES (?, ?, ?, ?)',
-        (file_id, original_name, filepath, file_size)
-    )
-    conn.commit()
-    conn.close()
+        # 落盘后再次确认大小，磁盘结果是唯一权威值
+        if file_size > MAX_FILE_SIZE:
+            raise ValueError(f'文件大小超过限制（最大{MAX_FILE_SIZE // 1024 // 1024}MB）')
+
+        conn = get_db()
+        cursor = conn.cursor()
+
+        # 防止连续拖放/重复提交导致同一文件重复入库：同名同大小视为同一文件，
+        # 直接返回已有记录，目录中不会重复出现
+        cursor.execute(
+            'SELECT id FROM files WHERE name = ? AND size = ? ORDER BY rowid DESC LIMIT 1',
+            (original_name, file_size)
+        )
+        existing = cursor.fetchone()
+        if existing:
+            conn.close()
+            os.remove(filepath)
+            logger.info(f"重复上传命中已有文件: {original_name} (ID: {existing['id']})")
+            return jsonify({
+                'success': True,
+                'duplicate': True,
+                'file_id': existing['id'],
+                'filename': original_name,
+                'size': file_size,
+                'message': '文件已存在，未重复上传'
+            })
+
+        cursor.execute(
+            'INSERT INTO files (id, name, path, size) VALUES (?, ?, ?, ?)',
+            (file_id, original_name, filepath, file_size)
+        )
+        conn.commit()
+        conn.close()
+    except ValueError as exc:
+        if os.path.exists(filepath):
+            os.remove(filepath)
+        return jsonify({'error': str(exc)}), 400
+    except Exception:
+        logger.exception(f"文件保存失败: {original_name}")
+        if os.path.exists(filepath):
+            os.remove(filepath)
+        return jsonify({'error': '文件保存失败，请重试'}), 500
 
     logger.info(f"文件上传成功: {original_name} (ID: {file_id}, 大小: {file_size} bytes)")
-    return jsonify({'success': True, 'file_id': file_id, 'filename': original_name})
+    # 返回最终落盘的权威属性，供前端提示/文件属性/列表回显共用
+    return jsonify({
+        'success': True,
+        'file_id': file_id,
+        'filename': original_name,
+        'size': file_size
+    })
 
 
 @files_bp.route('/api/files', methods=['GET'])
 def list_files():
-    conn = get_db()
-    cursor = conn.cursor()
-    cursor.execute('SELECT id, name, path, size FROM files')
-    files = [dict(row) for row in cursor.fetchall()]
-    conn.close()
+    """目录回显：只返回磁盘上真实存在且路径合法的记录，保证列表与实际可下载内容一致"""
+    try:
+        conn = get_db()
+        cursor = conn.cursor()
+        cursor.execute('SELECT id, name, path, size FROM files ORDER BY rowid DESC')
+        rows = [dict(row) for row in cursor.fetchall()]
+        conn.close()
+    except Exception:
+        logger.exception('读取文件列表失败')
+        return jsonify({'error': '文件列表加载失败'}), 500
+
+    files = []
+    for row in rows:
+        path = row.get('path') or ''
+        if not os.path.abspath(path).startswith(os.path.abspath(UPLOAD_FOLDER)):
+            logger.warning(f"跳过非法路径的文件记录: {row.get('id')}")
+            continue
+        if not os.path.exists(path):
+            # 上传失败/磁盘丢失的孤儿记录不进入目录，避免回显与实际不符
+            logger.warning(f"跳过磁盘文件缺失的记录: {row.get('id')} ({row.get('name')})")
+            continue
+        files.append(row)
     return jsonify(files)
 
 

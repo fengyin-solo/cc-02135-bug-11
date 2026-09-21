@@ -79,24 +79,73 @@ document.addEventListener('DOMContentLoaded', async () => {
     loadFileList();
 });
 
-// 验证文件
+// ========== 文件校验（与后端 routes/file_routes.py 同一套判定规则） ==========
+
+// 扩展名解析：与后端 get_file_extension 保持一致
+// - 无扩展名（含 ".bashrc" 这类点号开头的隐藏文件）返回 ''，视为合法
+// - 先去掉结尾的点和空格，避免 "a.exe." / "a.exe " 绕过黑名单
+function getFileExtension(filename) {
+    const name = (filename || '').trim().replace(/\.+$/g, '').trim();
+    const dot = name.lastIndexOf('.');
+    if (dot <= 0) return '';
+    return name.slice(dot + 1).trim().replace(/\.+$/g, '').trim().toLowerCase();
+}
+
+// 统一的文件校验入口：文件选择、拖放上传都走这里，判定结果与服务端一致
+// 返回错误字符串；null 表示通过
 function validateFile(file) {
+    const ext = getFileExtension(file.name);
+    if (CONFIG.BLOCKED_EXTENSIONS.includes(ext)) {
+        return '不支持的文件类型';
+    }
     if (file.size > CONFIG.MAX_FILE_SIZE) {
         return `文件大小超过限制（最大${CONFIG.MAX_FILE_SIZE / 1024 / 1024}MB）`;
     }
     return null;
 }
 
-// 上传文件处理函数
-async function uploadFile(file) {
-    const validationError = validateFile(file);
-    if (validationError) {
-        document.getElementById('uploadStatus').textContent = `❌ ${validationError}`;
-        return;
-    }
+// ========== 上传队列：连续拖放/重复选择同一文件时串行处理并去重 ==========
 
+let uploadQueue = [];          // 待上传文件队列（FIFO）
+let uploadInFlightKey = null;  // 正在上传的文件指纹，null 表示空闲
+
+function fileFingerprint(file) {
+    return `${file.name}::${file.size}::${file.lastModified || 0}`;
+}
+
+// 入参入口（选择/拖放统一走这里）：浏览器先按共享规则校验，失败立即收口，
+// 不发请求、不刷新列表，保证提示与最终目录一致
+function enqueueFiles(fileList) {
+    const files = Array.from(fileList || []);
+    let rejected = 0;
+    for (const file of files) {
+        const error = validateFile(file);
+        if (error) {
+            rejected++;
+            setUploadStatus(`❌ ${file.name}：${error}`);
+            continue;
+        }
+        const key = fileFingerprint(file);
+        if (key === uploadInFlightKey || uploadQueue.some(f => fileFingerprint(f) === key)) {
+            // 同一文件连续拖放/重复选择：不重复上传
+            setUploadStatus(`⚠️ ${file.name} 已在上传队列中，请勿重复添加`);
+            continue;
+        }
+        uploadQueue.push(file);
+    }
+    processUploadQueue();
+    return files.length - rejected;
+}
+
+async function processUploadQueue() {
+    if (uploadInFlightKey || uploadQueue.length === 0) return;
+
+    const file = uploadQueue.shift();
+    uploadInFlightKey = fileFingerprint(file);
+    setUploadingUI(true);
+    setUploadStatus(`⏳ 正在上传 ${file.name} ...（剩余 ${uploadQueue.length} 个排队）`);
     showLoading('上传中...');
-    
+
     const formData = new FormData();
     formData.append('file', file);
 
@@ -105,27 +154,56 @@ async function uploadFile(file) {
             method: 'POST',
             body: formData
         });
-        const result = await response.json();
-        
-        if (response.ok) {
-            document.getElementById('uploadStatus').textContent = `✅ ${file.name} 上传成功！`;
-            loadFileList();
+        let result = null;
+        try {
+            result = await response.json();
+        } catch {
+            result = null;
+        }
+
+        if (response.ok && result && result.success) {
+            // 服务端返回的是最终权威结果（可能是去重命中），提示以此为准
+            if (result.duplicate) {
+                setUploadStatus(`⚠️ ${result.filename} 已存在，未重复上传`);
+            } else {
+                setUploadStatus(`✅ ${result.filename} 上传成功！`);
+            }
+            // 成功后以服务端目录为准刷新（loadFileList 自带最新请求保护）
+            await loadFileList();
         } else {
-            document.getElementById('uploadStatus').textContent = `❌ 上传失败: ${result.error}`;
+            // 服务端拒绝：失败必须收口——给出明确提示，不把失败文件写进列表
+            const serverError = (result && result.error) || `服务端拒绝（HTTP ${response.status}）`;
+            setUploadStatus(`❌ ${file.name} 上传失败: ${serverError}`);
         }
     } catch (error) {
-        document.getElementById('uploadStatus').textContent = `❌ 上传失败: ${error.message}`;
+        setUploadStatus(`❌ ${file.name} 上传失败: ${error.message}`);
     } finally {
+        uploadInFlightKey = null;
+        setUploadingUI(false);
         hideLoading();
+        // 队列里还有文件则继续
+        if (uploadQueue.length > 0) {
+            processUploadQueue();
+        }
     }
 }
 
+function setUploadStatus(text) {
+    const el = document.getElementById('uploadStatus');
+    if (el) el.textContent = text;
+}
+
+function setUploadingUI(uploading) {
+    const zone = document.querySelector('.upload-zone');
+    const btn = document.querySelector('.upload-btn');
+    if (zone) zone.classList.toggle('uploading', uploading);
+    if (btn) btn.disabled = uploading;
+}
+
 // 文件选择上传
-document.getElementById('fileInput').addEventListener('change', async (e) => {
-    const file = e.target.files[0];
-    if (!file) return;
-    await uploadFile(file);
-    e.target.value = '';
+document.getElementById('fileInput').addEventListener('change', (e) => {
+    enqueueFiles(e.target.files);
+    e.target.value = ''; // 清空，保证同一文件可再次选择（也会被去重逻辑兜住）
 });
 
 // 拖拽上传
@@ -141,55 +219,85 @@ uploadZone.addEventListener('dragleave', (e) => {
     uploadZone.classList.remove('drag-over');
 });
 
-uploadZone.addEventListener('drop', async (e) => {
+uploadZone.addEventListener('drop', (e) => {
     e.preventDefault();
     uploadZone.classList.remove('drag-over');
-    
-    const file = e.dataTransfer.files[0];
-    if (file) {
-        await uploadFile(file);
-    }
+    // 支持多文件拖放，统一进入串行队列
+    enqueueFiles(e.dataTransfer.files);
 });
 
 // 加载文件列表
-async function loadFileList() {
-    showLoading('加载文件列表...');
-    
+// - 最新请求保护：并发拉取（连续上传/切换页面返回/提交后立即查看）时，
+//   只有最后一次请求的结果能写 DOM，避免旧响应覆盖新响应导致“旧大小/重复条目”
+// - 失败收口：请求失败时保留已有列表，绝不用错误/陈旧内容覆盖
+let fileListRequestSeq = 0;
+async function loadFileList(silent = false) {
+    const requestId = ++fileListRequestSeq;
+    if (!silent) showLoading('加载文件列表...');
+
+    let files;
     try {
         const response = await fetch(`${API_BASE}/files`);
-        const files = await response.json();
-        
-        const fileList = document.getElementById('fileList');
-        const isLoggedIn = TokenManager.get() && (await TokenManager.isValid());
-        
-        if (files.length === 0) {
-            fileList.innerHTML = '<p class="empty-msg">暂无可下载文件</p>';
-        } else {
-            fileList.innerHTML = files.map(file => `
-                <div class="file-item">
-                    <div class="file-info">
-                        <div class="file-icon">${getFileIcon(file.name)}</div>
-                        <div class="file-details">
-                            <div class="file-name">${escapeHtml(file.name)}</div>
-                            <div class="file-size">${formatSize(file.size)}</div>
-                        </div>
-                    </div>
-                    <div class="file-actions">
-                        ${isLoggedIn ? `<button class="share-btn" onclick="openShareModal('${escapeHtml(file.id)}', '${escapeHtml(file.name)}')">分享</button>` : ''}
-                        <button class="download-btn" onclick="requestDownload('${escapeHtml(file.id)}')">
-                            下载
-                        </button>
+        if (!response.ok) {
+            throw new Error(`服务端错误（HTTP ${response.status}）`);
+        }
+        files = await response.json();
+    } catch (error) {
+        // 失败收口：不覆盖已有列表，只给状态行一个短暂提示
+        const status = document.getElementById('uploadStatus');
+        if (status) status.textContent = `⚠️ 文件列表刷新失败，显示的可能不是最新内容: ${error.message}`;
+        if (!silent) hideLoading();
+        return;
+    }
+
+    // 陈旧响应（期间又发起了新的拉取）直接丢弃，不能覆盖最新结果
+    if (requestId !== fileListRequestSeq) {
+        if (!silent) hideLoading();
+        return;
+    }
+
+    const fileList = document.getElementById('fileList');
+    const isLoggedIn = TokenManager.get() && (await TokenManager.isValid());
+    // 登录态检查期间可能又有新请求产生，再校验一次
+    if (requestId !== fileListRequestSeq) {
+        if (!silent) hideLoading();
+        return;
+    }
+
+    if (!Array.isArray(files) || files.length === 0) {
+        fileList.innerHTML = '<p class="empty-msg">暂无可下载文件</p>';
+    } else {
+        fileList.innerHTML = files.map(file => `
+            <div class="file-item" data-file-id="${escapeHtml(file.id)}">
+                <div class="file-info">
+                    <div class="file-icon">${getFileIcon(file.name)}</div>
+                    <div class="file-details">
+                        <div class="file-name">${escapeHtml(file.name)}</div>
+                        <div class="file-size">${formatSize(file.size)}</div>
                     </div>
                 </div>
-            `).join('');
-        }
-    } catch (error) {
-        document.getElementById('fileList').innerHTML = 
-            `<p class="empty-msg">加载失败: ${escapeHtml(error.message)}</p>`;
-    } finally {
-        hideLoading();
+                <div class="file-actions">
+                    ${isLoggedIn ? `<button class="share-btn" onclick="openShareModal('${escapeHtml(file.id)}', '${escapeHtml(file.name)}')">分享</button>` : ''}
+                    <button class="download-btn" onclick="requestDownload('${escapeHtml(file.id)}')">
+                        下载
+                    </button>
+                </div>
+            </div>
+        `).join('');
     }
+    if (!silent) hideLoading();
 }
+
+// 切换页面/从分享页返回（bfcache 恢复）后立即拉取最新目录，
+// 避免“提交后立即查看/切回页面”看到的还是旧大小、旧条目
+window.addEventListener('pageshow', () => {
+    fileListRequestSeq++; // 作废所有在途旧请求
+    // 页面被缓存恢复时不可能还有真正在传的请求，重置队列状态
+    uploadQueue = [];
+    uploadInFlightKey = null;
+    setUploadingUI(false);
+    loadFileList(true);
+});
 
 // HTML转义防止XSS
 function escapeHtml(text) {
@@ -349,7 +457,7 @@ function hideLoading() {
 
 // 获取文件图标
 function getFileIcon(filename) {
-    const ext = filename.split('.').pop().toLowerCase();
+    const ext = getFileExtension(filename);
     const icons = {
         pdf: '📄', doc: '📝', docx: '📝', txt: '📃',
         jpg: '🖼️', jpeg: '🖼️', png: '🖼️', gif: '🖼️',
